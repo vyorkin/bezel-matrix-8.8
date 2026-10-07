@@ -1,0 +1,646 @@
+diff --git i/crates/bezel-cli/src/lib.rs w/crates/bezel-cli/src/lib.rs
+index f08f81a..a6712b5 100644
+--- i/crates/bezel-cli/src/lib.rs
++++ w/crates/bezel-cli/src/lib.rs
+@@ -25,7 +25,7 @@ use bezel_core::domain::geometry::Orientation;
+ use bezel_core::domain::theme::Fit;
+ use bezel_core::ports::{
+     DesktopModeHid, DeviceBus, FrameRenderer, MediaTranscoder, ScreenConnector, SensorSource,
+-    ThemeStore,
++    ThemeStore, VideoStream,
+ };
+ use clap::builder::NonEmptyStringValueParser;
+ use clap::{Parser, Subcommand, ValueEnum};
+@@ -249,6 +249,35 @@ pub enum Command {
+         #[arg(long, value_enum, default_value_t = FitArg::Cover)]
+         fit: FitArg,
+     },
++    /// Stream an H.264 file to a screen whose decoder plays it, as the vendor
++    /// app shows a theme video: the file is fed over the link in a loop and the
++    /// host draws nothing, so the screen shows it at the frame rate `--fps`
++    /// names. Until Ctrl+C (Turing USB screens, spec § 7).
++    Stream {
++        /// Screen to use.
++        #[command(flatten)]
++        target: Target,
++        /// The video: an Annex-B H.264 file (`.h264`), made for the panel's size.
++        video: PathBuf,
++        /// Frame rate to tell the panel's decoder.
++        #[arg(long, default_value_t = 20)]
++        fps: u8,
++        /// Device rotation in quarter turns (0-3) the video is started with,
++        /// as the vendor app's video preamble sets it. Persistent on the screen.
++        #[arg(long, default_value_t = 0)]
++        rotation: u8,
++        /// Backlight percent to set before the stream (left alone without it).
++        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
++        brightness: Option<u8>,
++        /// Spread one pass of the file over SECONDS instead of feeding it at
++        /// the video's own rate.
++        #[arg(long, value_name = "SECONDS")]
++        pace: Option<f32>,
++        /// Bytes per stream chunk (default 32768, capped at what the screen
++        /// reports it accepts).
++        #[arg(long, value_name = "BYTES")]
++        chunk: Option<usize>,
++    },
+     /// Turn the screen off. The next picture, pattern or theme wakes it.
+     Off {
+         /// Screen to use.
+@@ -458,6 +487,27 @@ where
+             (*fit).into(),
+         ),
+         Command::Off { target } => screen::off(bus, connector, target),
++        Command::Stream {
++            target,
++            video,
++            fps,
++            rotation,
++            brightness,
++            pace,
++            chunk,
++        } => screen::stream(
++            bus,
++            connector,
++            target,
++            video,
++            VideoStream {
++                fps: *fps,
++                rotation: *rotation,
++                brightness: *brightness,
++                pace: *pace,
++                chunk: *chunk,
++            },
++        ),
+         // Streams its output and needs a sensor source: see `run_sensors`.
+         Command::Sensors { .. } => anyhow::bail!("`sensors` runs through run_sensors"),
+         // Need sensors and themes: see `run_theme_command`.
+diff --git i/crates/bezel-cli/src/screen.rs w/crates/bezel-cli/src/screen.rs
+index 43213a1..4452a56 100644
+--- i/crates/bezel-cli/src/screen.rs
++++ w/crates/bezel-cli/src/screen.rs
+@@ -1,8 +1,10 @@
+ //! Commands that talk to a screen.
+ 
+ use std::collections::BTreeMap;
+-use std::io::Cursor;
++use std::io::{Cursor, Write};
+ use std::path::Path;
++use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::time::{Duration, Instant};
+ 
+ use anyhow::Context;
+@@ -15,7 +17,7 @@ use bezel_core::domain::screen::Brightness;
+ use bezel_core::domain::sensor::{Quantities, Snapshot};
+ use bezel_core::domain::theme::{AssetRef, Background, Fit, Theme};
+ use bezel_core::ports::{
+-    Backdrop, DeviceBus, FrameRenderer, RenderContext, ScreenConnector, ScreenLink,
++    Backdrop, DeviceBus, FrameRenderer, RenderContext, ScreenConnector, ScreenLink, VideoStream,
+ };
+ 
+ use crate::Target;
+@@ -182,6 +184,41 @@ where
+     ))
+ }
+ 
++/// `bezel stream`: feeds an H.264 file to a screen that decodes a stream
++/// itself (the vendor app's video path, spec § 7) until Ctrl+C. Nothing is
++/// rendered here: the panel shows the video at its own frame rate.
++pub fn stream<B, C>(
++    bus: &B,
++    connector: &C,
++    target: &Target,
++    video: &Path,
++    start: VideoStream,
++) -> anyhow::Result<String>
++where
++    B: DeviceBus + ?Sized,
++    C: ScreenConnector + ?Sized,
++{
++    anyhow::ensure!(
++        video.is_file(),
++        "cannot read {}: not a file",
++        video.display()
++    );
++    let mut link = connect(bus, connector, target)?;
++    let stop = Arc::new(AtomicBool::new(false));
++    let flag = Arc::clone(&stop);
++    ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst))?;
++    let name = describe(link.as_ref());
++    writeln!(
++        std::io::stderr(),
++        "{name}: streaming {} at {} fps; Ctrl+C to stop",
++        video.display(),
++        start.fps
++    )?;
++    link.stream_video(video, start, &stop)?;
++    link.release()?;
++    Ok(format!("{name}: stopped streaming\n"))
++}
++
+ /// `bezel off`.
+ pub fn off<B, C>(bus: &B, connector: &C, target: &Target) -> anyhow::Result<String>
+ where
+diff --git i/crates/bezel-core/src/ports/mod.rs w/crates/bezel-core/src/ports/mod.rs
+index 264b66f..aa88a72 100644
+--- i/crates/bezel-core/src/ports/mod.rs
++++ w/crates/bezel-core/src/ports/mod.rs
+@@ -20,6 +20,8 @@ use crate::domain::storage::{
+ };
+ use crate::domain::theme::{AssetRef, Theme};
+ use std::collections::BTreeMap;
++use std::path::Path;
++use std::sync::atomic::AtomicBool;
+ use std::time::Duration;
+ 
+ /// Driven port: enumerates the USB endpoints the host can see, without
+@@ -76,6 +78,24 @@ pub trait ScreenConnector {
+     }
+ }
+ 
++/// How to start a streamed video ([`ScreenLink::stream_video`]).
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct VideoStream {
++    /// Frame rate the decoder is told.
++    pub fps: u8,
++    /// Device-side rotation in quarter turns, sent as part of the video
++    /// preamble the vendor app sends (13; persistent on the device).
++    pub rotation: u8,
++    /// Backlight level in percent to set before the stream, when given (14).
++    pub brightness: Option<u8>,
++    /// Spread one pass of the file over this many seconds; `None` feeds it as
++    /// fast as the decoder takes it.
++    pub pace: Option<f32>,
++    /// Bytes per stream chunk; `None` uses the size the screen reports it
++    /// accepts.
++    pub chunk: Option<usize>,
++}
++
+ /// Driven port: one connected screen. Frames go in the orientation the user
+ /// looks at; the adapter rotates and encodes them for the panel and decides
+ /// between a full frame and a partial update.
+@@ -109,6 +129,22 @@ pub trait ScreenLink: Send {
+     fn storage(&mut self) -> Option<&mut dyn ScreenStorage> {
+         None
+     }
++    /// Streams an Annex-B H.264 file to a screen whose decoder plays it, as
++    /// the vendor app does with a theme video (TUR_USB, spec § 7): the host
++    /// renders and encodes nothing, and the file starts over at its end, so
++    /// the screen shows it until `stop` turns true. The default: a screen
++    /// that plays no streamed video.
++    fn stream_video(
++        &mut self,
++        source: &Path,
++        start: VideoStream,
++        stop: &AtomicBool,
++    ) -> Result<()> {
++        let _ = (source, start, stop);
++        Err(crate::BezelError::Unsupported(
++            "a video streamed over the link".into(),
++        ))
++    }
+ }
+ 
+ /// Driven port: files stored on a screen (internal flash and memory card,
+diff --git i/crates/bezel-devices/src/driver/turing_usb.rs w/crates/bezel-devices/src/driver/turing_usb.rs
+index 3220685..fb09920 100644
+--- i/crates/bezel-devices/src/driver/turing_usb.rs
++++ w/crates/bezel-devices/src/driver/turing_usb.rs
+@@ -19,8 +19,20 @@
+ //! (98) are never sent (the references disagree on their meaning, spec § 3),
+ //! so this link knows the size of a stored file only when it wrote it;
+ //! deleting (42), the start mode (125) and the boot logo are not offered.
++//!
++//! Streaming (spec § 7) goes out only from [`ScreenLink::stream_video`] — the
++//! vendor app's way of showing a theme video on this family: the frame rate
++//! (15), the chunk size (17), STREAM_CHUNK (121) with the decoder's queue
++//! depth (STREAM_STATUS, 122) as flow control, and STOP_STREAM (123) at the
++//! end. The panel decodes the stream itself, so the host renders nothing
++//! while it runs (unlike the stored-video path, which the firmware of the
++//! 8.8" V1.x refuses: `hardware_validated = false`).
+ 
+ use std::collections::BTreeMap;
++use std::fs::File;
++use std::io::{Read, Seek, SeekFrom};
++use std::path::Path;
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::time::Duration;
+ 
+ use bezel_core::domain::device::{DeviceModel, Family};
+@@ -32,7 +44,7 @@ use bezel_core::domain::standby::PlanB;
+ use bezel_core::domain::storage::{
+     Confirmed, FileName, Medium, RemotePath, Repeat, StorageInfo, StorageLocation,
+ };
+-use bezel_core::ports::{ScreenLink, ScreenStorage};
++use bezel_core::ports::{ScreenLink, ScreenStorage, VideoStream};
+ use bezel_core::{BezelError, Result};
+ use chrono::Timelike;
+ 
+@@ -67,6 +79,23 @@ const LIST_REPLIES: usize = 20;
+ const STOP_POLLS: usize = 10;
+ /// Pause between two PLAYBACK_BUSY polls (spec § 6).
+ const STOP_POLL_PAUSE: Duration = Duration::from_millis(100);
++/// Pause between two STREAM_CHUNK writes (spec § 7: the vendor app's 30 ms).
++const STREAM_PAUSE: Duration = Duration::from_millis(30);
++/// Pause between two STREAM_STATUS polls while the decoder's queue drains.
++const STREAM_POLL_PAUSE: Duration = Duration::from_millis(50);
++/// Queue depth (STREAM_STATUS `[8]`) above which the feed pauses. A safety net,
++/// not the pacing: the feed is paced to the video's own length (see
++/// [`TuringUsb::stream_file`]) and the 8.8" V1.x answers a steady 6 while it
++/// plays, so the vendor app's thresholds of 2 and 3 would stall it — measured
++/// 2026-10-08, when waiting for 3 to 6 left the panel frozen on the frame it
++/// had decoded, and feeding it with a lead (a queue of tens) tore the picture.
++const STREAM_QUEUE: u8 = 32;
++/// STREAM_STATUS polls before a queue that never drains is ignored: a screen
++/// that stopped answering must not hang the stream.
++const STREAM_POLLS: usize = 8;
++/// How long a STREAM_CHUNK waits for its reply. The vendor app carries on
++/// when none comes, so this is a short wait, not [`REPLY_TIMEOUT`].
++const STREAM_REPLY_TIMEOUT: Duration = Duration::from_millis(250);
+ /// File bytes per WRITE_CHUNK. The vendor app always sends a full 1 MiB
+ /// payload; the tail of a shorter last chunk is zero-filled here (the
+ /// vendor's holds stale data) and the header gives the real length.
+@@ -303,6 +332,102 @@ impl<W: Wire, C: Clock, P: Pause> TuringUsb<W, C, P> {
+             Err(e) => e,
+         }
+     }
++
++    /// One STREAM_CHUNK: its header and data in a single write (spec § 7),
++    /// then a short wait for the reply, which carries the decoder's queue
++    /// depth. A missing reply is not an error: the vendor app carries on.
++    fn send_stream_chunk(&mut self, header: &Header, data: &[u8]) -> Result<Vec<u8>> {
++        self.wire
++            .send(&proto::packet_and_payload(header, data))
++            .map_err(io_err)?;
++        let reply = self
++            .wire
++            .receive(proto::PACKET_LEN, STREAM_REPLY_TIMEOUT)
++            .map_err(io_err)?;
++        self.wire.discard_input().map_err(io_err)?;
++        Ok(reply)
++    }
++
++    /// Waits while the decoder's queue is deeper than the vendor app allows
++    /// (STREAM_STATUS, spec § 7), so the panel drains the stream at its own
++    /// rate instead of the link's.
++    fn await_decoder(&mut self, mut depth: Option<u8>) -> Result<()> {
++        for _ in 0..STREAM_POLLS {
++            if depth.is_none_or(|d| d <= STREAM_QUEUE) {
++                return Ok(());
++            }
++            self.pause.pause(STREAM_POLL_PAUSE);
++            let status = proto::simple(op::STREAM_STATUS, self.now());
++            depth = proto::queue_depth(&self.command(&status, &[])?);
++        }
++        tracing::debug!("the decoder's queue stayed full: streaming on");
++        Ok(())
++    }
++
++    /// Reads `file` in `chunk_size` blocks and streams them until `stop` says
++    /// so, starting over at the end of the file. The chunk that reaches the end
++    /// is marked as the last one ([`proto::stream_chunk`]), which is what the
++    /// decoder needs to join the next pass.
++    fn stream_file(
++        &mut self,
++        file: &mut File,
++        chunk_size: usize,
++        pace: Option<f32>,
++        stop: &AtomicBool,
++    ) -> Result<()> {
++        let total = file.metadata().map_err(io_err)?.len();
++        if total == 0 {
++            return Err(BezelError::InvalidInput(
++                "the file to stream is empty (no H.264 data)".into(),
++            ));
++        }
++        // `--pace`: one pass of the file spread over that many seconds. The
++        // fixed pause between chunks comes out of it (see `stream_file`).
++        let chunk_size = chunk_size.max(1);
++        let chunks = total.div_ceil(chunk_size as u64).max(1) as f32;
++        let pause = pace.map(|seconds| Duration::from_secs_f32((seconds / chunks).max(0.0)));
++        let mut chunk = vec![0u8; chunk_size];
++        let mut pass = std::time::Instant::now();
++        let mut sent = 0usize;
++        while !stop.load(Ordering::Relaxed) {
++            let mut last = false;
++            while !last && !stop.load(Ordering::Relaxed) {
++                let read = read_chunk(file, &mut chunk)?;
++                if read == 0 {
++                    return Err(BezelError::InvalidInput(
++                        "the file to stream has no H.264 data".into(),
++                    ));
++                }
++                last = read < chunk.len() || file.stream_position().unwrap_or(total) >= total;
++                if last {
++                    file.seek(SeekFrom::Start(0)).map_err(io_err)?;
++                }
++                let header = proto::stream_chunk(self.now(), read as u32, last);
++                let reply = self.send_stream_chunk(&header, &chunk[..read])?;
++                sent += read;
++                let depth = proto::queue_depth(&reply);
++                if last {
++                    tracing::debug!(
++                        bytes = sent,
++                        millis = pass.elapsed().as_millis(),
++                        queue = ?depth,
++                        "one pass of the file fed to the decoder"
++                    );
++                    pass = std::time::Instant::now();
++                    sent = 0;
++                }
++                self.await_decoder(depth)?;
++                // The fixed pause between chunks is part of the pace, not
++                // something added to it: a 24 s video fed over 21 chunks has to
++                // spend 1.14 s per chunk, not 1.17.
++                if let Some(pause) = pause {
++                    self.pause.pause(pause.saturating_sub(STREAM_PAUSE));
++                }
++                self.pause.pause(STREAM_PAUSE);
++            }
++        }
++        Ok(())
++    }
+ }
+ 
+ impl<W: Wire, C: Clock, P: Pause> ScreenLink for TuringUsb<W, C, P> {
+@@ -359,6 +484,70 @@ impl<W: Wire, C: Clock, P: Pause> ScreenLink for TuringUsb<W, C, P> {
+     fn storage(&mut self) -> Option<&mut dyn ScreenStorage> {
+         Some(self)
+     }
++
++    /// The vendor app's video path for a theme (spec § 7): the panel decodes
++    /// the Annex-B H.264 this link feeds it, so nothing is rendered or encoded
++    /// here and the video shows at the frame rate [`op::SET_FRAME_RATE`] names.
++    /// The file loops from its start until `stop` turns true.
++    ///
++    /// The preamble is the reference implementation's
++    /// (`lcd_comm_turing_usb.py:683-744`): STOP_PLAYBACK with its idle poll,
++    /// SET_ROTATION, THEME_START, a cleared panel and the frame rate — the
++    /// commands its table marks as the video preamble. Without it this
++    /// firmware queues every chunk and shows nothing (measured 2026-10-08).
++    fn stream_video(
++        &mut self,
++        source: &Path,
++        start: VideoStream,
++        stop: &AtomicBool,
++    ) -> Result<()> {
++        let mut file = File::open(source)
++            .map_err(|e| BezelError::InvalidInput(format!("{}: {e}", source.display())))?;
++        self.stop_playback()?;
++        let rotation = proto::set_rotation(self.now(), start.rotation);
++        self.command(&rotation, &[])?;
++        if let Some(percent) = start.brightness {
++            let level = proto::brightness_level(percent);
++            self.send_level(level)?;
++            self.level = Some(level);
++        }
++        let theme = proto::simple(op::THEME_START, self.now());
++        self.command(&theme, &[])?;
++        self.clear()?;
++        let rate = proto::set_frame_rate(self.now(), start.fps);
++        self.command(&rate, &[])?;
++        let query = proto::simple(op::GET_CHUNK_SIZE, self.now());
++        let reported = proto::chunk_size(&self.command(&query, &[])?) as usize;
++        // Smaller pieces than the screen reports (32 KiB was measured) read as
++        // heavy stutter on the 8.8" V1.x, so its own size is what goes out.
++        let chunk_size = start.chunk.unwrap_or(reported).clamp(1, reported);
++        // One pass of the file over the video's own length, unless the caller
++        // named another pace. The 8.8" V1.x shows both a faster feed and a
++        // smaller chunk as heavy artifacts (measured 2026-10-08): its decoder
++        // wants the size it reports, one piece at a time, at the rate the
++        // video plays.
++        let pace = match start.pace {
++            Some(pace) => Some(pace),
++            None => {
++                let frames = count_slices(&mut file)?;
++                (frames > 0).then(|| frames as f32 / f32::from(start.fps.max(1)))
++            }
++        };
++        tracing::info!(
++            path = %source.display(),
++            fps = start.fps,
++            rotation = start.rotation,
++            chunk_size,
++            ?pace,
++            "streaming H.264"
++        );
++        self.stream_file(&mut file, chunk_size, pace, stop)?;
++        // The vendor app ends a theme's video with STOP_STREAM; the device
++        // keeps showing the frame it stopped on.
++        let end = proto::simple(op::STOP_STREAM, self.now());
++        self.command(&end, &[])?;
++        Ok(())
++    }
+ }
+ 
+ impl<W: Wire, C: Clock, P: Pause> ScreenStorage for TuringUsb<W, C, P> {
+@@ -476,6 +665,36 @@ fn no_answer(what: &str) -> BezelError {
+     BezelError::Timeout(format!("the screen: no valid answer to {what}"))
+ }
+ 
++/// Fills `buf` from `file`, stopping at the file's end (a read may return
++/// fewer bytes than asked for in the middle of a file too).
++fn read_chunk(file: &mut File, buf: &mut [u8]) -> Result<usize> {
++    let mut filled = 0;
++    while filled < buf.len() {
++        let read = file.read(&mut buf[filled..]).map_err(io_err)?;
++        if read == 0 {
++            break;
++        }
++        filled += read;
++    }
++    Ok(filled)
++}
++
++/// The pictures in `file`, whose position is back at the start afterwards:
++/// the length of one pass of the stream, which paces a feed to the video.
++fn count_slices(file: &mut File) -> Result<u64> {
++    let mut slices = proto::Slices::default();
++    let mut block = vec![0u8; 256 * 1024];
++    loop {
++        let read = file.read(&mut block).map_err(io_err)?;
++        if read == 0 {
++            break;
++        }
++        slices.push(&block[..read]);
++    }
++    file.seek(SeekFrom::Start(0)).map_err(io_err)?;
++    Ok(slices.frames())
++}
++
+ /// SYNC until the reply echoes the command id; returns the version string.
+ fn sync<W: Wire, C: Clock, P: Pause>(wire: &mut W, clock: &C, pause: &P) -> Result<String> {
+     for attempt in 0..SYNC_TRIES {
+@@ -1318,4 +1537,102 @@ mod tests {
+         assert!(LocalClock.millis_since_midnight() < 86_400_000);
+         RealTime.pause(Duration::ZERO);
+     }
++
++    /// Turns the stop flag on after `budget` pauses, ending a stream in a
++    /// test (the streaming loop pauses once per chunk).
++    #[derive(Clone)]
++    struct StopAfter {
++        stop: Arc<AtomicBool>,
++        budget: Arc<Mutex<usize>>,
++    }
++
++    impl StopAfter {
++        fn new() -> Self {
++            Self {
++                stop: Arc::new(AtomicBool::new(false)),
++                budget: Arc::new(Mutex::new(0)),
++            }
++        }
++    }
++
++    impl Pause for StopAfter {
++        fn pause(&self, _d: Duration) {
++            let mut left = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
++            if *left == 0 {
++                self.stop.store(true, Ordering::SeqCst);
++                return;
++            }
++            *left -= 1;
++        }
++    }
++
++    /// A GET_CHUNK_SIZE reply naming `size` bytes per chunk.
++    fn chunk_size_reply(size: u32) -> Vec<u8> {
++        let mut r = answer(op::GET_CHUNK_SIZE, 8, 0);
++        r[8..12].copy_from_slice(&size.to_be_bytes());
++        r
++    }
++
++    #[test]
++    fn streaming_feeds_the_file_in_chunks_and_stops() {
++        let pause = StopAfter::new();
++        *pause.budget.lock().unwrap() = 2;
++        let mut s = connected_with(&pause, "turing-usb-8.8");
++        let dir = std::env::temp_dir().join(format!("bezel-stream-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let file = dir.join("clip.h264");
++        std::fs::write(&file, [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]).unwrap();
++
++        // Replies in the order the preamble and the chunks ask for them.
++        script(&mut s, stopped());
++        script(&mut s, [ok(op::SET_ROTATION), ok(op::THEME_START)]);
++        script(&mut s, [ok(op::SHOW_PNG), ok(op::SET_FRAME_RATE), chunk_size_reply(4)]);
++        script(&mut s, [answer(op::STREAM_CHUNK, 8, 0)]);
++        script(&mut s, [answer(op::STREAM_CHUNK, 8, 0)]);
++        script(&mut s, [answer(op::STREAM_CHUNK, 8, 0)]);
++        script(&mut s, [ok(op::STOP_STREAM)]);
++        let before = s.wire().sent.len();
++        let start = VideoStream {
++            fps: 20,
++            rotation: 0,
++            brightness: None,
++            pace: None,
++            chunk: None,
++        };
++        s.stream_video(&file, start, &Arc::clone(&pause.stop)).unwrap();
++
++        let sent = headers_since(&s, before);
++        let ops: Vec<u8> = sent.iter().map(|h| h[0]).collect();
++        assert_eq!(
++            ops,
++            [
++                op::STOP_PLAYBACK,
++                op::PLAYBACK_BUSY,
++                op::SET_ROTATION,
++                op::THEME_START,
++                op::SHOW_PNG,
++                op::SET_FRAME_RATE,
++                op::GET_CHUNK_SIZE,
++                op::STREAM_CHUNK,
++                op::STREAM_CHUNK,
++                op::STREAM_CHUNK,
++                op::STOP_STREAM,
++            ]
++        );
++        assert_eq!(sent[5][8], 20, "the frame rate the decoder is told");
++        let chunks: Vec<&Header> = sent.iter().filter(|h| h[0] == op::STREAM_CHUNK).collect();
++        for (h, (len, last)) in chunks.iter().zip([(4u32, 0u8), (4, 0), (2, 1)]) {
++            assert_eq!(u32::from_be_bytes([h[8], h[9], h[10], h[11]]), len);
++            assert_eq!(h[12], last, "the chunk that ends the file is marked");
++        }
++        // Each chunk is one write: the 512-byte packet and its data.
++        let writes = &s.wire().sent[before..];
++        let data: Vec<u8> = writes
++            .iter()
++            .filter(|w| plain(w)[0] == op::STREAM_CHUNK)
++            .flat_map(|w| w[proto::PACKET_LEN..].to_vec())
++            .collect();
++        assert_eq!(data, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
++        assert!(pause.stop.load(Ordering::SeqCst), "the stop flag ends the stream");
++    }
+ }
+diff --git i/crates/bezel-devices/src/protocol/turing_usb.rs w/crates/bezel-devices/src/protocol/turing_usb.rs
+index 932ab71..df9b7e1 100644
+--- i/crates/bezel-devices/src/protocol/turing_usb.rs
++++ w/crates/bezel-devices/src/protocol/turing_usb.rs
+@@ -463,6 +463,45 @@ pub fn queue_depth(reply: &[u8]) -> Option<u8> {
+     reply.get(8).copied()
+ }
+ 
++/// Counts the coded pictures of an Annex-B stream as its bytes are read, so a
++/// caller can pace a feed to the video's length. One slice is one picture on
++/// the streams the vendor app's ffmpeg line produces (x264's default is a
++/// single slice per picture); a stream cut elsewhere can only over-count,
++/// which paces a feed faster than the video.
++#[derive(Debug, Default)]
++pub struct Slices {
++    frames: u64,
++    window: u32,
++    header: bool,
++}
++
++impl Slices {
++    /// Feeds the next block of the stream (any block size, start codes may
++    /// straddle two of them).
++    pub fn push(&mut self, bytes: &[u8]) {
++        for &byte in bytes {
++            if self.header {
++                // A coded slice (1) or an IDR (5) is one picture; SPS (7),
++                // PPS (8), SEI (6) and the rest are not.
++                if matches!(byte & 0x1F, 1 | 5) {
++                    self.frames += 1;
++                }
++                self.header = false;
++                continue;
++            }
++            self.window = (self.window << 8) | u32::from(byte);
++            if self.window & 0x00FF_FFFF == 0x0000_0001 {
++                self.header = true;
++            }
++        }
++    }
++
++    /// Pictures so far.
++    pub fn frames(&self) -> u64 {
++        self.frames
++    }
++}
++
+ /// An encoded frame, ready to follow its header.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum Image {
+@@ -925,6 +964,18 @@ mod tests {
+         assert_eq!(&h[12..16], &(q95.len() as u32).to_be_bytes());
+     }
+ 
++    #[test]
++    fn slices_counts_coded_pictures_across_blocks() {
++        let mut slices = Slices::default();
++        // SPS and PPS are not pictures; an IDR and two slices are.
++        slices.push(&[0, 0, 1, 0x67, 0, 0, 1, 0x68]);
++        slices.push(&[0, 0, 1, 0x65, 1, 2, 3, 0, 0, 1, 0x41]);
++        // A start code straddling two blocks, and a four-byte one for an SEI.
++        slices.push(&[0, 0]);
++        slices.push(&[1, 0x41, 0, 0, 0, 1, 0x06]);
++        assert_eq!(slices.frames(), 3);
++    }
++
+     #[test]
+     fn storage_replies() {
+         let mut r = [0u8; PACKET_LEN];

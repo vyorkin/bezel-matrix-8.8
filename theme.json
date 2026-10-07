@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "name": "Matrix 8.8 — пиздец, хуй, не еби мозги",
+  "canvas": { "width": 480, "height": 1920 },
+  "orientation": "reverse-portrait",
+  "refreshSeconds": 1.0,
+  "background": {
+    "type": "video",
+    "asset": "assets/matrix.mp4",
+    "poster": "assets/poster.png"
+  },
+  "elements": []
+}

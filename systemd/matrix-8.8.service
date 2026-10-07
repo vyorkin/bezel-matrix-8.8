@@ -1,0 +1,22 @@
+# Дождь Matrix на панели Turing 8.8" (480x1920, вертикально).
+#
+# Панель играет H.264-поток сама: bezel кормит её файлом темы в реальном
+# времени и сам ничего не рисует. Слова, скорости, цвета и поворот лежат в
+# ~/.local/share/bezel/themes/matrix-8.8/config.toml; после правки — там же
+# ./generate.py, затем systemctl --user restart matrix-8.8.
+#
+# Порт панели держит только один процесс: служба bezel-run@omarchy-8.8 должна
+# быть выключена (enable --now), иначе два процесса будут драться за порт.
+[Unit]
+Description=Matrix rain on the smart screen (streamed H.264)
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/share/bezel/themes/matrix-8.8/run.sh
+Restart=on-failure
+RestartSec=5
+# SIGTERM останавливает поток и отдаёт панель обратно.
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target
